@@ -1279,6 +1279,10 @@
 
     <span class="titulo-seccion-config">Profil</span>
     <div class="grupo-input">
+      <label>Prénom affiché (apparaît en haut de la séance)</label>
+      <input type="text" id="perfil-nombre" maxlength="30" placeholder="Ex : Marie" autocomplete="off" style="font-family:'Inter',sans-serif;letter-spacing:normal">
+    </div>
+    <div class="grupo-input">
       <label>Avatar</label>
       <div class="fila-avatares" id="fila-avatares"></div>
       <input type="file" id="input-foto" accept="image/*" style="display:none" onchange="cargarFotoPerfil(event)">
@@ -1449,6 +1453,7 @@
         <textarea class="area-dictado" id="dictado-texto" placeholder="Écris ici ce que tu as entendu..." oninput="guardarBorradorDictado()"></textarea>
         <button class="btn-primario" onclick="corregirDictado()" style="max-width:240px">Vérifier ma dictée</button>
         <div id="resultado-dictado" style="margin-top:1rem;display:none"></div>
+        <div id="nav-dialogo" style="margin-top:0.9rem;display:none"></div>
       </div>
       <div id="panel-pronunciacion" style="display:none;margin-top:1.25rem"></div>
       <div id="panel-musica" style="display:none;margin-top:1.25rem"></div>
@@ -2074,7 +2079,7 @@ async function evaluarDELF() {
   const minimoEsperado = parseInt((esc.palabrasEscritura||'60-90').split('-')[0]) || 60;
 
   try {
-    const veredicto = await llamarGemini(
+    const veredicto = await llamarGeminiCalidad(
       `Eres un examinador certificado ${examen}. Evalúa esta producción escrita usando la GRILLE OFICIAL de France Éducation international para producción écrite ${nivel} (grille harmonisée CECR), con sus 5 criterios reales. Para cada criterio, da una nota EXACTA de entre estas 4 posibles: 0 (no respondido/insuficiente para evaluar) | 0.5 (por debajo del nivel ${nivel}) | 2 (al nivel ${nivel}: cumple los requisitos mínimos pero no confirma un dominio robusto) | 3 (${nivel}+: dominio robusto del nivel ${nivel}).
 
 Texto del alumno: "${escritura || '(vide)'}"
@@ -2292,77 +2297,125 @@ function guardarNotaHistorial(i, texto) {
 // ═══════════════════════════════════════════════════════════════════════════
 // LLAMADA A GEMINI
 // ═══════════════════════════════════════════════════════════════════════════
-async function llamarGemini(prompt, sistemaPrompt='', intentos=0, configExtra={}) {
-  const key = getKeyValida(perfilActivo);
-  if (!key) throw new Error('No hay clé API configurée. Va au profil et configure tes clés.');
+// ── MODELOS DE GEMINI (todo en capa GRATIS, sin tarjeta) ─────────────────────
+// Nombres verificados en ai.google.dev (septiembre 2026). Dos listas, de mejor a peor:
+//  - CALIDAD: correcciones y soluciones de ejercicios (donde un error le enseña algo falso al alumno)
+//  - NORMAL : lecciones, diálogos, vocabulario, chat (mucho volumen)
+// Si un modelo está saturado (503) o sin cuota (429), la app pasa al siguiente y "aparca" el
+// modelo unos minutos para no perder tiempo volviendo a intentarlo en cada llamada.
+// Para cambiar de modelo en el futuro, solo hay que editar estas listas.
+const MODELOS_CALIDAD = ['gemini-3.8-flash', 'gemini-3.7-flash', 'gemini-3.6-flash', 'gemini-3.5-flash', 'gemini-3.5-flash-lite', 'gemini-3.1-flash-lite'];
+const MODELOS_NORMAL  = ['gemini-3.6-flash', 'gemini-3.7-flash', 'gemini-3.5-flash', 'gemini-3.5-flash-lite', 'gemini-3.1-flash-lite', 'gemini-3.8-flash'];
+const PARKING_MS = { cuota: 15 * 60 * 1000, saturado: 2 * 60 * 1000, noexiste: 24 * 60 * 60 * 1000 };
+const CLAVE_PARKING = 'fef_modelos_aparcados';
+const pasoThinking = {};    // por modelo+perfil: 0 = tal cual, 1 = thinkingLevel low, 2 = sin thinkingConfig
+const esperar = ms => new Promise(r => setTimeout(r, ms));
 
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key=${key}`;
+function leerParking() { try { return JSON.parse(localStorage.getItem(CLAVE_PARKING) || '{}'); } catch(e) { return {}; } }
+function aparcarModelo(modelo, motivo) {
+  const p = leerParking();
+  p[modelo] = Date.now() + PARKING_MS[motivo];
+  try { localStorage.setItem(CLAVE_PARKING, JSON.stringify(p)); } catch(e) {}
+}
+function modeloAparcado(modelo) { return (leerParking()[modelo] || 0) > Date.now(); }
+
+function cuerpoParaPaso(cuerpo, paso) {
+  const c = JSON.parse(JSON.stringify(cuerpo));
+  const gc = c.generationConfig = c.generationConfig || {};
+  if (paso === 1) gc.thinkingConfig = { thinkingLevel: 'low' };
+  if (paso === 2) {
+    delete gc.thinkingConfig;
+    gc.maxOutputTokens = Math.min(8192, (gc.maxOutputTokens || 1200) * 3);
+  }
+  return c;
+}
+
+// Punto único de llamada a Gemini. Devuelve un Response OK.
+//  - 429 (cuota)         -> prueba la siguiente clé; si todas fallan, aparca el modelo 15 min y pasa al siguiente
+//  - 503/500/504         -> aparca el modelo 2 min y pasa al siguiente
+//  - 404 (no existe)     -> aparca 24 h y pasa al siguiente
+//  - 400 por "thinking"  -> reintenta ese modelo con otra configuración de razonamiento
+//  - tras recorrer todos los modelos, espera unos segundos y repite (hasta 3 rondas)
+async function fetchGemini(cuerpo, stream=false, perfil='normal') {
+  const lista = perfil === 'calidad' ? MODELOS_CALIDAD : MODELOS_NORMAL;
+  const nClaves = Math.max(1, getKeys(perfilActivo).filter(k => k.trim().length > 10).length);
+  let ultimoMsg = '', huboSaturacion = false, huboCuota = false;
+
+  for (let ronda = 0; ronda < 3; ronda++) {
+    let candidatos = lista.filter(m => !modeloAparcado(m));
+    if (!candidatos.length) candidatos = lista.slice(); // todos aparcados: se prueban igualmente
+    for (const modelo of candidatos) {
+      let intentosClave = 0;
+      while (true) {
+        const key = getKeyValida(perfilActivo);
+        if (!key) throw new Error('No hay clé API configurée. Va au profil et configure tes clés.');
+        const pk = modelo + '|' + perfil;
+        const paso = pasoThinking[pk] || 0;
+        const accion = stream ? 'streamGenerateContent?alt=sse&' : 'generateContent?';
+        const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelo}:${accion}key=${key}`;
+        let res;
+        try {
+          res = await fetch(url, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(cuerpoParaPaso(cuerpo, paso)) });
+        } catch(e) {
+          throw new Error('Pas de connexion internet. Vérifie ta connexion et réessaie.');
+        }
+        if (res.ok) return res;
+
+        let msg = 'Erreur API';
+        try { const err = await res.json(); msg = err.error?.message || msg; } catch(e) {}
+        ultimoMsg = msg;
+        console.warn(`[Gemini] ${modelo} (${perfil}) → ${res.status}: ${msg}`);
+
+        if (res.status === 429) {
+          huboCuota = true;
+          if (intentosClave < nClaves - 1) { keyActiva = (keyActiva + 1) % NUM_KEYS; intentosClave++; await esperar(400); continue; }
+          aparcarModelo(modelo, 'cuota');
+          break;
+        }
+        if (res.status === 400 && /think/i.test(msg) && paso < 2) { pasoThinking[pk] = (perfil === 'calidad') ? 2 : paso + 1; continue; }
+        if (res.status === 404) { aparcarModelo(modelo, 'noexiste'); huboSaturacion = true; break; }
+        if ([500, 503, 504].includes(res.status)) { aparcarModelo(modelo, 'saturado'); huboSaturacion = true; break; }
+        throw new Error(msg); // 400/401/403...: error real (clave inválida, etc.), no tiene sentido reintentar
+      }
+    }
+    if (!huboSaturacion) break;   // solo errores de cuota: reintentar enseguida no sirve de nada
+    if (ronda < 2) await esperar(2500 * (ronda + 1));
+  }
+  if (huboSaturacion) throw new Error('Gemini est surchargé en ce moment (tous les modèles ont répondu « forte demande »). Réessaie dans quelques minutes.');
+  if (huboCuota) throw new Error('Toutes les clés ont atteint leur limite quotidienne. Réessaie demain, ou ajoute une nouvelle clé dans Configuration.');
+  throw new Error(ultimoMsg || 'Erreur API');
+}
+
+async function llamarGemini(prompt, sistemaPrompt='', intentos=0, configExtra={}, perfil='normal') {
+  const gc = { temperature: 0.7, maxOutputTokens: 2560, thinkingConfig: { thinkingBudget: 0 }, ...configExtra };
+  if (perfil === 'calidad') {
+    gc.thinkingConfig = { thinkingLevel: 'low' };               // razonar un poco antes de corregir / fijar la solución
+    gc.maxOutputTokens = (configExtra.maxOutputTokens || 2560) + 2048; // el razonamiento también consume tokens de salida
+  }
   const body = {
     contents: [{ role:'user', parts:[{ text: sistemaPrompt ? sistemaPrompt+'\n\n'+prompt : prompt }] }],
-    generationConfig: { temperature: 0.7, maxOutputTokens: 2560, thinkingConfig: { thinkingBudget: 0 }, ...configExtra }
+    generationConfig: gc
   };
+  const res = await fetchGemini(body, false, perfil);
+  const data = await res.json();
+  return data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+}
 
-  try {
-    const res = await fetch(url, {
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body: JSON.stringify(body)
-    });
-    if (!res.ok) {
-      const err = await res.json();
-      if (res.status === 429 && intentos < NUM_KEYS) {
-        keyActiva = (keyActiva + 1) % NUM_KEYS;
-        await new Promise(r => setTimeout(r, 1500));
-        return llamarGemini(prompt, sistemaPrompt, intentos+1, configExtra);
-      }
-      if (res.status === 429) {
-        throw new Error('Toutes les clés ont atteint leur limite quotidienne. Réessaie demain, ou ajoute une nouvelle clé dans Configuration.');
-      }
-      throw new Error(err.error?.message || 'Erreur API');
-    }
-    const data = await res.json();
-    return data.candidates?.[0]?.content?.parts?.[0]?.text || '';
-  } catch(e) {
-    if (e.message.includes('Failed to fetch') || e.message.includes('NetworkError')) {
-      throw new Error('Pas de connexion internet. Vérifie ta connexion et réessaie.');
-    }
-    throw e;
-  }
+// Para correcciones y soluciones de ejercicios: mejor modelo disponible, poca "creatividad", razonamiento activado.
+function llamarGeminiCalidad(prompt, sistemaPrompt='', intentos=0, configExtra={}) {
+  return llamarGemini(prompt, sistemaPrompt, intentos, { temperature: 0.3, ...configExtra }, 'calidad');
 }
 
 // Historial para chat multi-turno
 async function llamarGeminiChat(historial, sistemaPrompt, intentos=0) {
-  const key = getKeyValida(perfilActivo);
-  if (!key) throw new Error('No hay clé API.');
-
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key=${key}`;
   const contents = historial.map(m => ({ role: m.role, parts:[{ text: m.content }] }));
   if (sistemaPrompt) {
     contents[0] = { role:'user', parts:[{ text: sistemaPrompt + '\n\n' + contents[0].parts[0].text }] };
   }
-
-  const res = await fetch(url, {
-    method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({
-      contents,
-      generationConfig: { temperature: 0.75, maxOutputTokens: 1200, thinkingConfig: { thinkingBudget: 0 } }
-    })
-  });
-  if (!res.ok) {
-    const err = await res.json();
-    // Limite d'essais = NUM_KEYS, comme llamarGemini() : évite une boucle
-    // infinie si toutes les clés sont épuisées (bug corrigé).
-    if (res.status === 429 && intentos < NUM_KEYS) {
-      keyActiva = (keyActiva + 1) % NUM_KEYS;
-      await new Promise(r => setTimeout(r, 1500));
-      return llamarGeminiChat(historial, sistemaPrompt, intentos+1);
-    }
-    if (res.status === 429) {
-      throw new Error('Toutes les clés ont atteint leur limite quotidienne. Réessaie demain, ou ajoute une nouvelle clé dans Configuration.');
-    }
-    throw new Error(err.error?.message || 'Erreur API');
-  }
+  const res = await fetchGemini({
+    contents,
+    generationConfig: { temperature: 0.75, maxOutputTokens: 1200, thinkingConfig: { thinkingBudget: 0 } }
+  }, false);
   const data = await res.json();
   return data.candidates?.[0]?.content?.parts?.[0]?.text || '';
 }
@@ -2467,7 +2520,7 @@ function mostrarConfig(nombre, desdeSesion=false) {
   document.getElementById('ecran-historial').style.display = 'none';
   const ec = document.getElementById('ecran-config');
   ec.style.display = 'flex';
-  document.getElementById('config-titulo').textContent = `Configuration — ${nombre}`;
+  document.getElementById('config-titulo').textContent = `Configuration — ${getNombreVisible(nombre)}`;
   document.getElementById('config-subtitulo').textContent = desdeSesion
     ? "Gère tes clés API et ton profil. Reviens à la séance quand tu as terminé."
     : "Introduis tes clés API Gemini pour commencer. Elles restent uniquement dans ton navigateur (jamais envoyées ailleurs qu'à Google) — mais quelqu'un ayant un accès physique à cet appareil pourrait techniquement les retrouver. Ne les utilise pas sur un ordinateur partagé avec des inconnus.";
@@ -2489,6 +2542,9 @@ function mostrarConfig(nombre, desdeSesion=false) {
   avatarSeleccionado = meta.avatar || '👤';
   fotoSeleccionada = meta.foto || '';
   document.getElementById('perfil-email').value = meta.email || '';
+  let nombreGuardado = '';
+  try { nombreGuardado = localStorage.getItem('fef_nombrevisible_' + nombre) || ''; } catch(e) {}
+  document.getElementById('perfil-nombre').value = nombreGuardado;
   renderizarAvatares();
 }
 
@@ -2538,6 +2594,8 @@ function guardarKeys() {
   const keysArr = [];
   for (let i = 1; i <= NUM_KEYS; i++) keysArr.push(document.getElementById('key'+i).value.trim());
   if (!keysArr[0]) { alert('La clé 1 est obligatoire.'); return; }
+  const nuevoNombre = document.getElementById('perfil-nombre').value.trim().slice(0, 30);
+  if (nuevoNombre) setNombreVisible(perfilActivo, nuevoNombre);
   saveKeys(perfilActivo, keysArr);
   savePerfilMeta(perfilActivo, {
     avatar: fotoSeleccionada ? '' : avatarSeleccionado,
@@ -2547,6 +2605,7 @@ function guardarKeys() {
   subirDatosNube();
   document.getElementById('ecran-config').style.display = 'none';
   if (configDesdeSesion) {
+    actualizarCabeceraPerfil();
     document.getElementById('ecran-sesion').style.display = 'flex';
   } else {
     iniciarSesion(perfilActivo);
@@ -2631,7 +2690,7 @@ function importarProgreso(event) {
     try {
       const paquete = JSON.parse(reader.result);
       if (!paquete || !paquete.datos) throw new Error('Format invalide');
-      const ok = confirm(`Importer cette sauvegarde va remplacer la progression actuelle de ${perfilActivo} (séance atteinte, historique, avatar). Les clés API ne sont pas touchées. Continuer ?`);
+      const ok = confirm(`Importer cette sauvegarde va remplacer la progression actuelle de ${getNombreVisible(perfilActivo)} (séance atteinte, historique, avatar). Les clés API ne sont pas touchées. Continuer ?`);
       if (!ok) return;
       const d = leerPerfil(perfilActivo);
       Object.keys(paquete.datos).forEach(k => { d[k] = paquete.datos[k]; });
@@ -2948,6 +3007,64 @@ function pararTodosTemporizadores() {
   for (const k in temporizadoresActivos) delete temporizadoresActivos[k];
 }
 
+// ── Marcadores de carga ("Génération...") ─────────────────────────────────
+// Los render*() reemplazan el contenido de estos contenedores y, con ello, borran el
+// marcador #gen-*. Al empezar OTRA séance sin recargar la página (refaire, aperçu,
+// niveau suivant) el marcador ya no existía y la app fallaba. Ahora: (1) se guarda la
+// versión original una sola vez, (2) se restaura al empezar cada séance, y (3) el
+// acceso a #gen-* ya no lanza error si el elemento falta.
+const _esqueletosCarga = {};
+const _CONTENEDORES_GEN = { 'gen-oral':'texto-oral-generado', 'gen-lectura':'panel-lectura', 'gen-vocab':'lista-vocab', 'gen-escritura':'consigna-escritura', 'gen-cierre':'contenido-cierre' };
+function restaurarMarcadoresCarga() {
+  ['texto-oral-generado','lista-vocab','consigna-escritura'].forEach(id => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    if (!(id in _esqueletosCarga)) _esqueletosCarga[id] = el.innerHTML; // 1ª vez: guarda el original
+    else el.innerHTML = _esqueletosCarga[id];                            // siguientes: restaura
+  });
+  const show = (id, v) => { const e = document.getElementById(id); if (e) e.style.display = v; };
+  const gl = document.getElementById('gen-lectura'); if (gl) gl.style.display = '';
+  show('contenido-lectura', 'none');
+  show('btn-escuchar', 'none');
+  show('resultado-dictado', 'none'); const rd = document.getElementById('resultado-dictado'); if (rd) rd.innerHTML = '';
+  show('nav-dialogo', 'none');
+  const dt = document.getElementById('dictado-texto'); if (dt) dt.value = '';
+  const po = document.getElementById('pestanas-oral'); if (po) po.innerHTML = '';
+  const pe = document.getElementById('pestanas-escritura'); if (pe) pe.innerHTML = '';
+  const te = document.getElementById('texto-escritura'); if (te) { te.value = ''; te.style.display = 'none'; }
+  show('botones-escritura', 'none');
+  show('btn-anki-todas', 'none');
+}
+function setGenDisplay(id, v) { const e = document.getElementById(id); if (e) e.style.display = v; }
+function escribirGen(id, html) {
+  const e = document.getElementById(id) || document.getElementById(_CONTENEDORES_GEN[id] || '');
+  if (e) { e.innerHTML = html; e.style.display = ''; }
+}
+
+// Dibuja arriba a la izquierda el prénom elegido (y avatar/foto), no el ID interno.
+function actualizarCabeceraPerfil() {
+  const id = perfilActivo;
+  if (!id) return;
+  const idx = PERFILES.indexOf(id);
+  const nombreVis = getNombreVisible(id);
+  const meta = getPerfilMeta(id);
+  const mono = document.getElementById('mono-mini');
+  const c = COLORES_MONOGRAMA[idx >= 0 ? idx : 0];
+  mono.style.background = `linear-gradient(135deg,${c},${c}AA)`;
+  mono.style.overflow = 'hidden';
+  if (meta.foto) {
+    mono.innerHTML = `<img src="${meta.foto}" style="width:100%;height:100%;object-fit:cover;border-radius:50%">`;
+  } else {
+    mono.textContent = meta.avatar || nombreVis[0].toUpperCase();
+  }
+  const h = document.getElementById('nombre-sesion');
+  h.textContent = nombreVis;
+  h.style.cursor = 'pointer';
+  h.title = 'Changer le prénom affiché';
+  h.onclick = () => mostrarConfig(perfilActivo, true);
+  if (typeof sesionData !== 'undefined' && sesionData) sesionData.nombre = nombreVis;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // INICIAR SESIÓN
 // ═══════════════════════════════════════════════════════════════════════════
@@ -3007,6 +3124,7 @@ function iniciarSesion(nombre) {
   const textoReal = document.getElementById('texto-real-pegado');
   if (textoReal) textoReal.value = '';
 
+  restaurarMarcadoresCarga();
   const progresoActual = getProgreso(nombre);
   const nivel = esRefaccion && nivelForzado ? nivelForzado : progresoActual.nivel;
   const numSesion = esRefaccion && numSesionForzado ? numSesionForzado : progresoActual.sesion + 1;
@@ -3022,11 +3140,8 @@ function iniciarSesion(nombre) {
   // interne P1..P6) : c'est ce qui part vers l'IA, les exports et les impressions.
   sesionData = { nombre: getNombreVisible(nombre), id: nombre, nivel, numSesion, tipoDia, label: labels[tipoDia-1], prog };
 
-  // Actualizar cabecera
-  const mono = nombre[0];
-  document.getElementById('mono-mini').textContent = mono;
-  document.getElementById('mono-mini').style.background = `linear-gradient(135deg,${COLORES_MONOGRAMA[idx]},${COLORES_MONOGRAMA[idx]}AA)`;
-  document.getElementById('nombre-sesion').textContent = nombre;
+  // Actualizar cabecera (nombre visible, no el ID interno P1..P6)
+  actualizarCabeceraPerfil();
   document.getElementById('info-sesion-sub').textContent = `Niveau ${nivel} · Séance ${numSesion} · ${prog.titulo}`;
   document.getElementById('badge-nivel').textContent = nivel;
   document.getElementById('badge-sesion').textContent = esAdelanto ? `Séance ${numSesion} (aperçu)` : esRefaccion ? `Séance ${numSesion} (refaite)` : `Séance ${numSesion}`;
@@ -3233,35 +3348,14 @@ async function iniciarCalentamiento() {
 // Streaming real de Gemini para el chat (corrección: antes "escribiendo..."
 // era solo un ícono de carga, la respuesta aparecía entera de golpe).
 async function llamarGeminiChatStream(historial, sistemaPrompt, onChunk, intentos=0) {
-  const key = getKeyValida(perfilActivo);
-  if (!key) throw new Error('No hay clé API.');
-
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:streamGenerateContent?alt=sse&key=${key}`;
   const contents = historial.map(m => ({ role: m.role, parts:[{ text: m.content }] }));
   if (sistemaPrompt) {
     contents[0] = { role:'user', parts:[{ text: sistemaPrompt + '\n\n' + contents[0].parts[0].text }] };
   }
-
-  const res = await fetch(url, {
-    method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({
-      contents,
-      generationConfig: { temperature: 0.75, maxOutputTokens: 1200, thinkingConfig: { thinkingBudget: 0 } }
-    })
-  });
-  if (!res.ok) {
-    const err = await res.json();
-    if (res.status === 429 && intentos < NUM_KEYS) {
-      keyActiva = (keyActiva + 1) % NUM_KEYS;
-      await new Promise(r => setTimeout(r, 1500));
-      return llamarGeminiChatStream(historial, sistemaPrompt, onChunk, intentos+1);
-    }
-    if (res.status === 429) {
-      throw new Error('Toutes les clés ont atteint leur limite quotidienne. Réessaie demain, ou ajoute une nouvelle clé dans Configuration.');
-    }
-    throw new Error(err.error?.message || 'Erreur API');
-  }
+  const res = await fetchGemini({
+    contents,
+    generationConfig: { temperature: 0.75, maxOutputTokens: 1200, thinkingConfig: { thinkingBudget: 0 } }
+  }, true);
   if (!res.body || !res.body.getReader) {
     // Navegador sin soporte de streaming: caemos de vuelta a la versión sin streaming.
     return llamarGeminiChat(historial, sistemaPrompt);
@@ -3519,7 +3613,9 @@ Le tableau "dialogues" doit contenir exactement 3 chaînes non vides, une par di
     iniciarPractiquePrononciation();
     generarMusicaDelDia();
   } catch(e) {
-    document.getElementById('gen-oral').innerHTML = `<p style="color:#F0A0A0;font-size:0.82rem">❌ ${mensajeError(e)}</p>`;
+    const errHtml = `<p style="color:#F0A0A0;font-size:0.82rem">❌ ${mensajeError(e)}</p>`;
+    const go = document.getElementById('gen-oral');
+    if (go) go.innerHTML = errHtml; else document.getElementById('texto-oral-generado').innerHTML = errHtml;
   }
 }
 
@@ -3535,12 +3631,39 @@ function guardarBorradorDictado() {
   dictadosBorrador[dialogoActivoIdx] = document.getElementById('dictado-texto').value;
 }
 
+function renderizarNavDialogo() {
+  const nav = document.getElementById('nav-dialogo');
+  if (!nav) return;
+  const idx = dialogoActivoIdx;
+  const hechos = resultadosDictadoActuales.filter(Boolean).length;
+  if (!resultadosDictadoActuales[idx]) { nav.style.display = 'none'; nav.innerHTML = ''; return; }
+  nav.style.display = 'flex';
+  nav.style.gap = '0.6rem';
+  nav.style.alignItems = 'center';
+  nav.style.flexWrap = 'wrap';
+  let html = '';
+  if (idx < dialogosOralActuales.length - 1) {
+    html += `<button class="btn-primario" style="max-width:260px" onclick="irADialogoSiguiente()">Dialogue ${idx + 2} →</button>`;
+  }
+  const faltan = resultadosDictadoActuales.map((r, i) => r ? null : i + 1).filter(Boolean);
+  if (hechos >= 3) html += `<span style="font-size:0.82rem;color:#90C8A0">✓ Les 3 dictées sont faites — tu peux cliquer sur « Terminer → ».</span>`;
+  else if (idx === dialogosOralActuales.length - 1 && faltan.length) html += `<span style="font-size:0.82rem;color:var(--gris2)">Il reste à vérifier : Dialogue ${faltan.join(', ')}.</span>`;
+  nav.innerHTML = html;
+}
+function irADialogoSiguiente() {
+  const sig = Math.min(dialogoActivoIdx + 1, dialogosOralActuales.length - 1);
+  mostrarDialogoOral(sig);
+  const p = document.getElementById('pestanas-oral');
+  if (p && p.scrollIntoView) p.scrollIntoView({ behavior: 'smooth', block: 'center' });
+}
+
 function mostrarDialogoOral(idx) {
   guardarBorradorDictado(); // sauvegarde le brouillon du dialogue qu'on quitte
   dialogoActivoIdx = idx;
   textoOralActual = dialogosOralActuales[idx]; // pour prononciation/rétrocompat
 
-  document.getElementById('gen-oral').style.display = 'none';
+  const genOral = document.getElementById('gen-oral'); // desaparece del DOM tras el 1er render: no asumir que existe
+  if (genOral) genOral.style.display = 'none';
   document.getElementById('texto-oral-generado').innerHTML = `<div class="texto-dictado">${escapeHTML(dialogosOralActuales[idx]).replace(/\n/g,'<br>')}</div>`;
   document.getElementById('btn-escuchar').style.display = 'flex';
   document.getElementById('dictado-texto').value = dictadosBorrador[idx] || '';
@@ -3556,22 +3679,71 @@ function mostrarDialogoOral(idx) {
   }
 
   renderizarPestanasOral();
+  renderizarNavDialogo();
 }
 
 function escucharTextoOral() {
-  // Quita "- Prénom :" de cada línea para que se escuche como diálogo natural, no como lista.
-  const textoParaVoz = dialogosOralActuales[dialogoActivoIdx].split('\n').map(l => l.replace(/^-\s*[^:]+:\s*/,'')).join('. ');
-  leerTextoDirecto(textoParaVoz, 0.85);
+  const lineas = (dialogosOralActuales[dialogoActivoIdx] || '').split('\n').map(l => l.trim()).filter(Boolean);
+  if (!lineas.length) { alert("Le dialogue n'est pas encore prêt."); return; }
+  const fr = vocesFrancesas();
+  const hablantes = [];
+  const items = lineas.map(l => {
+    const m = l.match(/^-?\s*([^:]{1,30}):\s*(.*)$/);
+    const nombre = m ? m[1].trim() : '';
+    const texto = (m ? m[2] : l.replace(/^-\s*/, '')).trim();
+    if (nombre && !hablantes.includes(nombre)) hablantes.push(nombre);
+    const k = Math.max(0, hablantes.indexOf(nombre)) % 2;
+    return { texto, pitch: k === 0 ? 0.95 : 1.25, voz: fr.length > 1 ? fr[k] : fr[0] };
+  }).filter(it => it.texto);
+  hablarCola(items, 0.85);
 }
 
+// ── VOZ (Web Speech) ────────────────────────────────────────────────────
+// Chrome tiene varios fallos conocidos: speak() justo después de cancel() se pierde,
+// el objeto utterance puede ser recogido por el recolector de basura y cortarse a mitad,
+// y la síntesis puede quedar en pausa. Además las voces cargan de forma asíncrona.
+const _utterancesVivas = [];
+let _avisoSinVozMostrado = false;
+function vocesFrancesas() {
+  try {
+    const v = window.speechSynthesis.getVoices() || [];
+    const fr = v.filter(x => /^fr([-_]|$)/i.test(x.lang));
+    return fr.sort((a, b) => (b.localService ? 1 : 0) - (a.localService ? 1 : 0)); // locales primero (más fiables)
+  } catch(e) { return []; }
+}
+if (window.speechSynthesis && window.speechSynthesis.addEventListener) {
+  window.speechSynthesis.addEventListener('voiceschanged', () => {}); // fuerza la carga de voces
+  try { window.speechSynthesis.getVoices(); } catch(e) {}
+}
+// Lee una lista de {texto, pitch, voz?} una tras otra.
+function hablarCola(items, rate=0.9) {
+  if (!window.speechSynthesis || !items.length) return;
+  const ss = window.speechSynthesis;
+  ss.cancel();
+  _utterancesVivas.length = 0;
+  setTimeout(() => {
+    try { if (ss.paused) ss.resume(); } catch(e) {}
+    items.forEach((it, i) => {
+      const u = new SpeechSynthesisUtterance(it.texto);
+      u.lang = 'fr-FR';
+      u.rate = rate;
+      if (it.pitch) u.pitch = it.pitch;
+      if (it.voz) u.voice = it.voz;
+      u.onerror = (ev) => {
+        if (ev && (ev.error === 'canceled' || ev.error === 'interrupted')) return;
+        console.warn('[TTS] error:', ev && ev.error);
+        if (!_avisoSinVozMostrado) { _avisoSinVozMostrado = true; alert("Le navigateur n'arrive pas à lire le texte à voix haute (erreur : " + ((ev && ev.error) || 'inconnue') + "). Vérifie que le son n'est pas coupé et que Chrome a une voix française installée."); }
+      };
+      _utterancesVivas.push(u); // referencia viva: evita que se corte a mitad
+      ss.speak(u);
+    });
+  }, 80);
+}
 // Lit n'importe quel texte français à voix haute (bouton 🔊 des blocs Lecture, Vocabulaire, Écriture...)
 function leerTextoDirecto(texto, rate=0.9) {
   if (!texto) return;
-  window.speechSynthesis.cancel();
-  const utterance = new SpeechSynthesisUtterance(texto);
-  utterance.lang = 'fr-FR';
-  utterance.rate = rate;
-  window.speechSynthesis.speak(utterance);
+  const fr = vocesFrancesas();
+  hablarCola([{ texto, voz: fr[0] }], rate);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -3716,7 +3888,7 @@ async function corregirDictado() {
   div.innerHTML = '<div class="indicador-cargando"><div class="punto"></div><div class="punto"></div><div class="punto"></div></div>';
 
   try {
-    const resultado = await llamarGemini(
+    const resultado = await llamarGeminiCalidad(
       `Texte original: "${dialogosOralActuales[idx]}"
 Texte écrit par l'élève: "${escrito}"
 
@@ -3734,6 +3906,7 @@ ES: [la misma explicación en español, máximo 6 líneas]`
     };
     div.innerHTML = renderCorreccionBilingue(resultadosDictadoActuales[idx].fr, resultadosDictadoActuales[idx].es, 'Résultat de la dictée');
     renderizarPestanasOral();
+    renderizarNavDialogo();
   } catch(e) {
     div.innerHTML = `<p style="color:#F0A0A0;font-size:0.82rem">❌ ${e.message}</p>`;
   }
@@ -3987,7 +4160,7 @@ async function verificarEscuchaMusica() {
     // L'app ne connaît pas les paroles exactes de la vraie chanson : le
     // retour porte sur la qualité du français écrit, pas sur une comparaison
     // mot à mot avec des paroles qu'elle n'a pas.
-    const resultado = await llamarGemini(
+    const resultado = await llamarGeminiCalidad(
       `Un élève de français niveau ${sesionData.nivel} a écouté la chanson "${cancionDelDia?.titulo || 'une chanson française'}" sur YouTube et a écrit ce qu'il a compris : "${texto}"
 Comme tu ne connais pas les paroles exactes, ne les compare pas. Donne uniquement un retour sur la qualité du français écrit par l'élève (orthographe, grammaire, cohérence) et encourage-le à continuer à écouter de la musique française.
 Réponds EXACTEMENT dans ce format:
@@ -4047,12 +4220,12 @@ Rien d'autre. N'oublie pas de terminer le texte et TOUTES les questions, ne t'ar
     guardarCacheSesion('lectura', { texto: textoLecturaActual, preguntas: preguntasLecturaActuales });
     renderizarLectura();
   } catch(e) {
-    document.getElementById('gen-lectura').innerHTML = `<p style="color:#F0A0A0;font-size:0.82rem">❌ ${e.message}</p>`;
+    escribirGen('gen-lectura', `<p style="color:#F0A0A0;font-size:0.82rem">❌ ${mensajeError(e)}</p>`);
   }
 }
 
 function renderizarLectura() {
-  document.getElementById('gen-lectura').style.display = 'none';
+  setGenDisplay('gen-lectura','none');
   document.getElementById('texto-lectura').innerHTML = escapeHTML(textoLecturaActual).replace(/\n/g,'<br><br>');
 
   const divPregs = document.getElementById('preguntas-lectura');
@@ -4080,7 +4253,7 @@ async function corregirLectura() {
   div.innerHTML = '<div class="indicador-cargando"><div class="punto"></div><div class="punto"></div><div class="punto"></div></div>';
 
   try {
-    const resultado = await llamarGemini(
+    const resultado = await llamarGeminiCalidad(
       `Texte de référence: "${textoLecturaActual}"
 
 ${respuestas}
@@ -4216,7 +4389,7 @@ async function corregirPreguntasTextoOptativo(idx) {
   const preguntas = preguntasOptativoActuales[idx] || [];
   const respuestas = preguntas.map((p,i) => `${i+1}. ${p} → ${document.getElementById('resp-optativo-'+idx+'-'+i)?.value?.trim() || '(pas de réponse)'}`).join('\n');
   try {
-    const resultado = await llamarGemini(
+    const resultado = await llamarGeminiCalidad(
       `Voici les réponses d'un élève de niveau ${sesionData.nivel} à 10 questions sur un texte de lecture optionnel:\n${respuestas}\n\nÉvalue-les ensemble, signale les erreurs importantes, termine par un encouragement. Maximum 8 lignes.
 Réponds EXACTEMENT dans ce format:
 FR: [évaluation en français simple]
@@ -4281,7 +4454,7 @@ async function corregirPreguntasTextoReal() {
   div.innerHTML = `<div class="indicador-cargando"><div class="punto"></div><div class="punto"></div><div class="punto"></div></div>`;
   const respuestas = preguntasTextoRealActuales.map((p,i) => `${i+1}. ${p} → ${document.getElementById('resp-real-'+i)?.value?.trim() || '(pas de réponse)'}`).join('\n');
   try {
-    const resultado = await llamarGemini(
+    const resultado = await llamarGeminiCalidad(
       `Voici les réponses d'un élève de niveau ${sesionData.nivel} à 10 questions sur un texte réel:\n${respuestas}\n\nÉvalue-les ensemble, signale les erreurs importantes, termine par un encouragement. Maximum 8 lignes.
 Réponds EXACTEMENT dans ce format:
 FR: [évaluation en français simple]
@@ -4352,13 +4525,13 @@ Retourne UNIQUEMENT les ${listeMots.length} lignes, dans l'ordre, rien d'autre.`
     renderizarVocabulario();
   } catch(e) {
     if (intento < 1) return generarVocabulario(intento+1);
-    document.getElementById('gen-vocab').innerHTML = `<p style="color:#F0A0A0;font-size:0.82rem">❌ ${e.message}</p>`;
+    escribirGen('gen-vocab', `<p style="color:#F0A0A0;font-size:0.82rem">❌ ${mensajeError(e)}</p>`);
   }
 }
 
 function renderizarVocabulario() {
   const div = document.getElementById('lista-vocab');
-  document.getElementById('gen-vocab').style.display = 'none';
+  setGenDisplay('gen-vocab','none');
 
   let html = '';
   tarjetasVocab.forEach((t, i) => {
@@ -4564,7 +4737,7 @@ function mostrarConsignaEscritura(idx) {
   consignaActivaIdx = idx;
   consignaEscritura = c.texto;
 
-  document.getElementById('gen-escritura').style.display = 'none';
+  setGenDisplay('gen-escritura','none');
   document.getElementById('consigna-escritura').innerHTML = `<div class="consigna">✍ ${escapeHTML(consignaEscritura)}</div>
     <p style="font-size:0.72rem;color:var(--gris2);margin-top:0.5rem">💡 Grammaire du jour : ${escapeHTML(sesionData.prog.gram)}${c.oficial ? ' · Consigne officielle du programme' : ''}</p>`;
   document.getElementById('texto-escritura').style.display = 'block';
@@ -4594,7 +4767,7 @@ async function corregirEscritura() {
   div.innerHTML = '<div class="indicador-cargando"><div class="punto"></div><div class="punto"></div><div class="punto"></div></div>';
 
   try {
-    const resultado = await llamarGemini(
+    const resultado = await llamarGeminiCalidad(
       `Consigne: "${consignaEscritura}"
 Texte de l'élève (niveau ${sesionData.nivel}): "${texto}"
 
@@ -4703,7 +4876,7 @@ const GENERADORES_EJERCICIOS = [
   // 0. Écoute — QCM sur une phrase orale (leerTextoDirecto la lit à voix haute)
   async function genEjEcoute() {
     const p = sesionData.prog;
-    const r = await llamarGemini(
+    const r = await llamarGeminiCalidad(
       `Génère 10 exercices d'écoute niveau ${sesionData.nivel} sur le thème "${p.titulo}", en lien avec ce vocabulaire: ${p.vocab}.
 Pour chaque exercice: une phrase courte en français (que l'élève va écouter), une question de compréhension sur cette phrase, et 3 options de réponse (A, B, C) dont une seule correcte.
 FORMAT EXACT, une ligne par exercice, séparée par | (rien d'autre avant/après):
@@ -4718,7 +4891,7 @@ Retourne UNIQUEMENT les 10 lignes.`, '');
   // 1. Association — 10 paires français → espagnol
   async function genEjAssociation() {
     const p = sesionData.prog;
-    const r = await llamarGemini(
+    const r = await llamarGeminiCalidad(
       `Génère 10 paires mot/expression français → traduction espagnole, niveau ${sesionData.nivel}, en lien avec le thème "${p.titulo}" et ce vocabulaire si possible: ${p.vocab}. Choisis des mots différents de ceux déjà utilisés ailleurs si possible.
 FORMAT EXACT, une paire par ligne:
 mot_francais|traduction_espagnole
@@ -4731,7 +4904,7 @@ Retourne UNIQUEMENT les 10 lignes.`, '');
   // 2. Grammaire — 10 phrases à trous sur le point de grammaire du jour
   async function genEjGrammaire() {
     const p = sesionData.prog;
-    const r = await llamarGemini(
+    const r = await llamarGeminiCalidad(
       `Génère 10 phrases à trous niveau ${sesionData.nivel} pour pratiquer ce point de grammaire: "${p.gram}", en lien avec le thème "${p.titulo}".
 Chaque phrase a UN mot manquant remplacé par "_____".
 FORMAT EXACT, une par ligne:
@@ -4746,7 +4919,7 @@ Retourne UNIQUEMENT les 10 lignes.`, '');
   // 3. Phrases courtes — 10 mini-consignes, une phrase de réponse chacune
   async function genEjPhrasesCourtes() {
     const p = sesionData.prog;
-    const r = await llamarGemini(
+    const r = await llamarGeminiCalidad(
       `Génère 10 consignes courtes niveau ${sesionData.nivel} pour écrire CHACUNE une seule phrase en français, en lien avec le thème "${p.titulo}" et ce vocabulaire: ${p.vocab}. Consignes variées, différentes les unes des autres.
 FORMAT EXACT, une consigne par ligne, sans numérotation:
 consigne
@@ -4759,7 +4932,7 @@ Retourne UNIQUEMENT les 10 lignes.`, '');
   async function genEjPrononciation() {
     const p = sesionData.prog;
     const esc = getEscalaDificultad(sesionData.numSesion);
-    const r = await llamarGemini(
+    const r = await llamarGeminiCalidad(
       `Génère 10 phrases naturelles niveau ${sesionData.nivel} pour un exercice de prononciation, en lien avec le thème "${p.titulo}" et ce point de phonétique si pertinent: ${p.phon}.
 IMPORTANT sur la longueur: chaque phrase doit faire environ ${esc.palabrasPronunciacion} mots (vocabulaire et grammaire strictement niveau ${sesionData.nivel} malgré la longueur — voir la même règle que pour le texte de lecture).
 FORMAT EXACT, une phrase par ligne, sans numérotation:
@@ -4909,7 +5082,7 @@ async function corregirBloqueEjercicio(idx) {
   }
 
   try {
-    const resultado = await llamarGemini(
+    const resultado = await llamarGeminiCalidad(
       `Voici les réponses d'un élève niveau ${sesionData.nivel} à 15 exercices (bloc "${TITRES_BLOCS_EJ[idx]}"):
 ${bloque}
 
@@ -4935,7 +5108,7 @@ async function generarCierre() {
   const div = document.getElementById('contenido-cierre');
   if (div.innerHTML.trim()) return; // ya generado
 
-  document.getElementById('gen-cierre').style.display = 'flex';
+  setGenDisplay('gen-cierre','flex');
 
   // Solo mensajes reales del alumno (no el mensaje de sistema inicial "Séance X · Thème...")
   const mensajesAlumno = historialChat0.filter(m => m.role === 'user');
@@ -5013,7 +5186,7 @@ Máximo 10 líneas. Tono cálido y directo. Termina siempre en una frase complet
       } catch(e) { /* si falla, simplemente no hay errores estructurados esta sesión */ }
     }
 
-    document.getElementById('gen-cierre').style.display = 'none';
+    setGenDisplay('gen-cierre','none');
     div.style.display = 'block';
     const bloqueDELF = resultadoDELFActual ? `
       <div class="separador"></div>
@@ -5042,7 +5215,7 @@ Máximo 10 líneas. Tono cálido y directo. Termina siempre en una frase complet
     // Plan adaptatif hebdomadaire — toutes les 6 séances (manuel §11.2, étape 7)
     generarPlanAdaptativoSemanal();
   } catch(e) {
-    document.getElementById('gen-cierre').style.display = 'none';
+    setGenDisplay('gen-cierre','none');
     div.style.display = 'block';
     div.innerHTML = `<p style="color:#F0A0A0;font-size:0.82rem">❌ ${e.message}</p>`;
   }
@@ -5404,11 +5577,7 @@ function leerEnVozAlta(contenedorId) {
   const ultima = burbujas[burbujas.length - 1];
   let texto = ultima.textContent.trim();
 
-  window.speechSynthesis.cancel();
-  const utterance = new SpeechSynthesisUtterance(texto);
-  utterance.lang = 'fr-FR';
-  utterance.rate = 0.9;
-  window.speechSynthesis.speak(utterance);
+  leerTextoDirecto(texto, 0.9);
 }
 
 // Lit le DERNIER message de l'ÉLÈVE (pas du professeur) — utile pour se réécouter et s'auto-corriger la prononciation.
