@@ -5597,5 +5597,191 @@ function leerMiUltimoMensaje(contenedorId) {
 // la pantalla de carga visible; onAuthStateChanged la oculta y decide si mostrar
 // el login o los perfiles.
 </script>
+<script>
+// ═══════════════════════════════════════════════════════════════════════════
+// GUARDADO DEL PROGRESO DENTRO DE LA SESIÓN (parche)
+// Antes solo se guardaba el contenido generado (diálogos, textos...), pero NO
+// lo que el alumno escribía ni los resultados. Ahora se guarda en el navegador
+// (localStorage, dentro de la caché de la sesión) y se restaura al reabrir.
+// Se borra solo al terminar la sesión (finalizarSesion ya borra esa caché).
+// ═══════════════════════════════════════════════════════════════════════════
+(function () {
+  let estadoGuardado = null;      // lo que había guardado al abrir la sesión
+  let timer = null;
+  let sesionActiva = false;
+  let moduloActivoActual = 0;
+  const restaurado = { oral:false, lectura:false, escritura:false };
+
+  function copiaProfunda(x) { try { return JSON.parse(JSON.stringify(x)); } catch(e) { return x; } }
+
+  function capturar() {
+    const s = estadoGuardado || {};
+    const e = {};
+    e.completados = Array.from(modulosCompletados);
+    e.modulo = moduloActivoActual;
+    e.chat0 = copiaProfunda(historialChat0);
+    e.chat1 = copiaProfunda(historialChat1);
+    e.nota = notaSesionActual;
+    e.errores = copiaProfunda(erroresSesionActual);
+
+    if (restaurado.oral) {
+      try { guardarBorradorDictado(); } catch(err) {}
+      e.oral = { firma: dialogosOralActuales.join('\u0001'), borrador: copiaProfunda(dictadosBorrador),
+                 resultados: copiaProfunda(resultadosDictadoActuales), idx: dialogoActivoIdx,
+                 agregado: copiaProfunda(resultadoDictadoActual) };
+    } else if (s.oral) e.oral = s.oral;
+
+    if (restaurado.lectura) {
+      e.lectura = { firma: textoLecturaActual,
+                    respuestas: preguntasLecturaActuales.map((p,i) => (document.getElementById('resp-'+i) || {}).value || ''),
+                    resultado: copiaProfunda(resultadoLecturaActual) };
+    } else if (s.lectura) e.lectura = s.lectura;
+
+    if (restaurado.escritura) {
+      try { guardarBorradorEscritura(); } catch(err) {}
+      e.escritura = { firma: consignasEscrituraOpciones.map(c => c && c.texto).join('\u0001'),
+                      borrador: copiaProfunda(textosEscrituraBorrador),
+                      resultados: copiaProfunda(resultadosEscrituraActuales),
+                      idx: consignaActivaIdx, ultimo: copiaProfunda(resultadoEscrituraActual) };
+    } else if (s.escritura) e.escritura = s.escritura;
+    return e;
+  }
+
+  function guardarAhora() {
+    clearTimeout(timer);
+    if (!sesionActiva || typeof sesionData === 'undefined' || !sesionData || esRefaccion || esAdelanto) return;
+    try {
+      const e = capturar();
+      guardarCacheSesion('estado', e);
+      estadoGuardado = e;
+    } catch(err) { console.warn('No se pudo guardar el progreso de la sesión:', err); }
+  }
+  function programar() { clearTimeout(timer); timer = setTimeout(guardarAhora, 500); }
+
+  // Envuelve una función global para guardar después de que termine.
+  function envolver(nombre, despues) {
+    const orig = window[nombre];
+    if (typeof orig !== 'function') { console.warn('Parche progreso: no existe', nombre); return; }
+    window[nombre] = function () {
+      const r = orig.apply(this, arguments);
+      if (r && typeof r.then === 'function') return r.then(v => { despues && despues.apply(null, arguments); return v; });
+      despues && despues.apply(null, arguments);
+      return r;
+    };
+  }
+
+  function pintarChat(contId, historial, situacion) {
+    const c = document.getElementById(contId);
+    if (!c) return;
+    c.innerHTML = '';
+    if (situacion) agregarMensajeSistema(contId, situacion);
+    historial.forEach(m => {
+      if (m.role === 'user') agregarMensajeUsuario(contId, m.content);
+      else agregarMensajeProfesor(contId, m.content);
+    });
+  }
+
+  // ── Al abrir la sesión: restaurar lo que no depende del contenido generado ──
+  const iniciarSesionOrig = window.iniciarSesion;
+  window.iniciarSesion = function () {
+    const r = iniciarSesionOrig.apply(this, arguments);
+    sesionActiva = true;
+    restaurado.oral = restaurado.lectura = restaurado.escritura = false;
+    moduloActivoActual = 0;
+    estadoGuardado = null;
+    try { estadoGuardado = leerCacheSesion().estado || null; } catch(e) {}
+    const s = estadoGuardado;
+    if (s) {
+      try {
+        modulosCompletados = new Set(s.completados || []);
+        const tabs = document.querySelectorAll('.tab-modulo');
+        modulosCompletados.forEach(i => { if (tabs[i]) tabs[i].className = 'tab-modulo completado'; });
+        actualizarBotonTerminar();
+        notaSesionActual = s.nota || '';
+        const nt = document.getElementById('notas-texto'); if (nt) nt.value = notaSesionActual;
+        erroresSesionActual = s.errores || [];
+        if (s.chat0 && s.chat0.length) {
+          historialChat0 = s.chat0;
+          pintarChat('chat-mensajes-0', historialChat0, `Séance ${sesionData.numSesion} · Thème : ${sesionData.prog.titulo}`);
+        }
+        if (s.chat1 && s.chat1.length) {
+          historialChat1 = s.chat1;
+          pintarChat('chat-mensajes-1', historialChat1, `Situation : ${sesionData.prog.role}`);
+        }
+        const m = Math.min(s.modulo || 0, 6);
+        if (m > 0 && tabs[m]) cambiarModulo(m, tabs[m]);
+      } catch(e) { console.warn('No se pudo restaurar parte del progreso:', e); }
+    }
+    return r;
+  };
+
+  // El calentamiento no debe volver a saludar si ya se restauró la conversación.
+  const calOrig = window.iniciarCalentamiento;
+  window.iniciarCalentamiento = function () {
+    if (historialChat0.length) return Promise.resolve();
+    return calOrig.apply(this, arguments);
+  };
+
+  // ── Restaurar cada módulo cuando su contenido generado ya está en pantalla ──
+  envolver('generarContenidoOral', function () {
+    if (!dialogosOralActuales.every(d => d && d.trim())) return; // generación fallida: no tocar lo guardado
+    const o = estadoGuardado && estadoGuardado.oral;
+    if (o && o.firma === dialogosOralActuales.join('\u0001')) {
+      dictadosBorrador = o.borrador || ['', '', ''];
+      resultadosDictadoActuales = o.resultados || [null, null, null];
+      if (o.agregado) resultadoDictadoActual = o.agregado;
+      dialogoActivoIdx = 0;
+      document.getElementById('dictado-texto').value = dictadosBorrador[0] || ''; // evita que se pise el borrador 1
+      mostrarDialogoOral(Math.min(o.idx || 0, dialogosOralActuales.length - 1));
+    }
+    restaurado.oral = true;
+  });
+
+  envolver('generarTextoLectura', function () {
+    if (!textoLecturaActual) return;
+    const l = estadoGuardado && estadoGuardado.lectura;
+    if (l && l.firma === textoLecturaActual) {
+      (l.respuestas || []).forEach((v, i) => { const el = document.getElementById('resp-' + i); if (el) el.value = v; });
+      if (l.resultado && l.resultado.es) {
+        resultadoLecturaActual = l.resultado;
+        const div = document.getElementById('resultado-lectura');
+        div.style.display = 'block';
+        div.innerHTML = renderCorreccionBilingue(l.resultado.fr, l.resultado.es, 'Correction');
+      }
+    }
+    restaurado.lectura = true;
+  });
+
+  envolver('generarConsignaEscritura', function () {
+    if (!consignasEscrituraOpciones.length || !consignasEscrituraOpciones.every(Boolean)) return;
+    const w = estadoGuardado && estadoGuardado.escritura;
+    if (w && w.firma === consignasEscrituraOpciones.map(c => c && c.texto).join('\u0001')) {
+      textosEscrituraBorrador = w.borrador || ['', '', ''];
+      resultadosEscrituraActuales = w.resultados || [null, null, null];
+      if (w.ultimo) resultadoEscrituraActual = w.ultimo;
+      consignaActivaIdx = 0;
+      document.getElementById('texto-escritura').value = textosEscrituraBorrador[0] || '';
+      mostrarConsignaEscritura(Math.min(w.idx || 0, 2));
+    }
+    restaurado.escritura = true;
+  });
+
+  // ── Cuándo guardar ──
+  ['cambiarModulo'].forEach(n => envolver(n, function (i) { moduloActivoActual = i; guardarAhora(); }));
+  ['marcarCompletado', 'enviarMensaje', 'corregirDictado', 'corregirLectura', 'corregirEscritura',
+   'mostrarDialogoOral', 'mostrarConsignaEscritura', 'guardarNotaHistorial'].forEach(n => envolver(n, guardarAhora));
+  document.addEventListener('input', programar, true);          // cada vez que escribe
+  document.addEventListener('visibilitychange', () => { if (document.hidden) guardarAhora(); });
+  window.addEventListener('pagehide', guardarAhora);
+  window.addEventListener('beforeunload', guardarAhora);
+
+  // Al terminar la sesión no debe quedar nada pendiente de guardar.
+  const finOrig = window.finalizarSesion;
+  window.finalizarSesion = function () {
+    clearTimeout(timer); sesionActiva = false;
+    return finOrig.apply(this, arguments);
+  };
+})();
+</script>
 </body>
 </html>
